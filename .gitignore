@@ -1,0 +1,20 @@
+# Never publish local credentials, local configuration, or diagnostics.
+credentials*
+*.dat
+*.log
+*.log.*
+config.json
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.tmp
+*.zip
+setup-preview.png
