@@ -49,9 +49,15 @@ $path = $env:ZJU_AUTOLOGIN_DATA_DIR
 $acl = [System.IO.Directory]::GetAccessControl(
     $path, [System.Security.AccessControl.AccessControlSections]::Access)
 $acl.SetAccessRuleProtection($true, $false)
+# Keep the explicit rules of both identities that may run this tool: the
+# interactive user and SYSTEM. Only broad built-in groups are removed, so the
+# user-session run and the session-independent run cannot strip each other.
+$broad = @('S-1-1-0', 'S-1-5-7', 'S-1-5-11', 'S-1-5-32-545')
 foreach ($rule in @($acl.GetAccessRules(
     $true, $false, [System.Security.Principal.SecurityIdentifier]))) {
-    $acl.RemoveAccessRuleSpecific($rule)
+    if ($broad -contains $rule.IdentityReference.Value) {
+        $acl.RemoveAccessRuleSpecific($rule)
+    }
 }
 foreach ($identity in @($sid, $system)) {
     $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
@@ -153,7 +159,7 @@ class Blob(ctypes.Structure):
     _fields_ = [('cbData', wintypes.DWORD), ('pbData', ctypes.POINTER(ctypes.c_ubyte))]
 
 
-def protect(data, decrypt=False):
+def protect(data, decrypt=False, machine=False):
     if os.name != 'nt':
         raise CampusError('Windows is required for credential encryption/decryption')
     buffer = ctypes.create_string_buffer(data)
@@ -167,7 +173,10 @@ def protect(data, decrypt=False):
     fn.argtypes = [ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.c_void_p,
                    ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(Blob)]
     fn.restype = wintypes.BOOL
-    if not fn(ctypes.byref(source), None, None, None, None, 1, ctypes.byref(target)):
+    # CRYPTPROTECT_UI_FORBIDDEN, plus CRYPTPROTECT_LOCAL_MACHINE for the
+    # session-independent task.
+    flags = 1 | (4 if machine else 0)
+    if not fn(ctypes.byref(source), None, None, None, None, flags, ctypes.byref(target)):
         raise CampusError('Windows credential encryption/decryption failed')
     try:
         return ctypes.string_at(target.pbData, target.cbData)
@@ -175,43 +184,58 @@ def protect(data, decrypt=False):
         kernel.LocalFree(target.pbData)
 
 
+# User scope for interactive runs; machine scope for the SYSTEM task, which
+# cannot read data protected for a user profile.
+CREDENTIAL_STORES = (('credentials.dat', False), ('credentials.system.dat', True))
+
+
 def save_credentials(username, password):
     if not isinstance(username, str) or not isinstance(password, str) or not username.strip() or not password:
         raise CampusError('Username and password are required')
     data = json.dumps(dict(username=username.strip(), password=password)).encode('utf-8')
     directory = ensure_data_dir()
-    temp = directory / 'credentials.tmp'
+    blobs = {name: protect(data, machine=machine) for name, machine in CREDENTIAL_STORES}
     try:
-        temp.write_bytes(protect(data))
-        temp.replace(directory / 'credentials.dat')
+        for name, blob in blobs.items():
+            (directory / (name + '.tmp')).write_bytes(blob)
+        for name in blobs:
+            (directory / (name + '.tmp')).replace(directory / name)
     except OSError:
         raise CampusError('Cannot save encrypted credentials') from None
     finally:
-        try:
-            temp.unlink(missing_ok=True)
-        except OSError:
-            raise CampusError('Cannot remove temporary encrypted credentials') from None
+        for name in blobs:
+            try:
+                (directory / (name + '.tmp')).unlink(missing_ok=True)
+            except OSError:
+                raise CampusError('Cannot remove temporary encrypted credentials') from None
 
 
 def load_credentials():
-    file = DATA_DIR / 'credentials.dat'
-    try:
-        encrypted = file.read_bytes()
-    except FileNotFoundError:
-        raise CampusError('Credentials not configured; run Setup.cmd locally') from None
-    except OSError:
-        raise CampusError('Cannot read encrypted credentials') from None
-    try:
-        credentials = json.loads(protect(encrypted, decrypt=True))
-        if (not isinstance(credentials, dict)
-                or not isinstance(credentials.get('username'), str)
-                or not credentials['username'].strip()
-                or not isinstance(credentials.get('password'), str)
-                or not credentials['password']):
-            raise ValueError
-    except (ValueError, TypeError):
-        raise CampusError('Stored credentials are invalid; run Setup.cmd locally') from None
-    return credentials
+    unusable = False
+    for name, machine in CREDENTIAL_STORES:
+        file = DATA_DIR / name
+        if not file.exists():
+            continue
+        unusable = True
+        try:
+            encrypted = file.read_bytes()
+        except OSError:
+            raise CampusError('Cannot read encrypted credentials') from None
+        try:
+            credentials = json.loads(protect(encrypted, decrypt=True, machine=machine))
+            if (not isinstance(credentials, dict)
+                    or not isinstance(credentials.get('username'), str)
+                    or not credentials['username'].strip()
+                    or not isinstance(credentials.get('password'), str)
+                    or not credentials['password']):
+                raise ValueError
+        except (CampusError, ValueError, TypeError):
+            continue
+        logging.info('Credentials loaded from %s', name)
+        return credentials
+    if unusable:
+        raise CampusError('Stored credentials are invalid; run Setup.cmd locally')
+    raise CampusError('Credentials not configured; run Setup.cmd locally')
 
 
 def recv_exact(sock, size):
@@ -389,15 +413,23 @@ def run(check_only=False):
 
 
 def main():
+    global DATA_DIR
     parser = argparse.ArgumentParser(
         description='Check ZJU authentication; log in only after confirmed offline status.',
-        epilog='Run Setup.cmd to store credentials locally and enable the hourly Windows task. '
-               'The task also runs at Windows logon and works while locked, not after sign-out. '
+        epilog='Run Setup.cmd to store credentials locally and enable the Windows task. '
+               'Installed with administrator rights it runs at startup and periodically as SYSTEM, '
+               'without any user session; otherwise it runs at Windows logon and periodically in '
+               'the current user session (works while locked, not after sign-out). '
                'Logs are in the per-user ZjuCampusAutoLogin application data directory. '
                'Remove scheduling: powershell -File Install-Task.ps1 -Remove. '
                'No logout requests or proxy configuration changes are made.')
     parser.add_argument('--check', action='store_true', help='Query only; never authenticate')
+    parser.add_argument('--data-dir', help='override the runtime data directory (used by the scheduled task)')
     args = parser.parse_args()
+    if args.data_dir:
+        # The SYSTEM task has no user profile, so the installer passes the
+        # interactive user's data directory explicitly.
+        DATA_DIR = Path(args.data_dir).expanduser()
     try:
         directory = ensure_data_dir()
         handler = RotatingFileHandler(directory / 'campus.log', maxBytes=262144,

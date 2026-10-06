@@ -1,6 +1,7 @@
 """Protocol vectors captured from the ZJU portal's own JavaScript implementation."""
 import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -115,6 +116,77 @@ class ConfigurationTests(IsolatedTests):
             with self.assertRaises(app.CampusError) as caught:
                 app.run()
         self.assertNotIn(secret, str(caught.exception))
+
+
+class CredentialStoreTests(IsolatedTests):
+    def test_data_dir_override_reaches_runtime_configuration(self):
+        (self.data / 'config.json').write_text('{"ac_id":"81"}', encoding='utf-8')
+        seen = {}
+
+        def fake_run(check_only=False):
+            seen['config'] = app.load_config()
+            return 0
+
+        with patch.object(app, 'ensure_data_dir', return_value=self.data), \
+             patch.object(app, 'run', side_effect=fake_run), \
+             patch.object(app, 'RotatingFileHandler', lambda *args, **kwargs: app.logging.NullHandler()), \
+             patch.object(app.logging, 'basicConfig'), \
+             patch.object(sys, 'argv', ['campus_login.py', '--data-dir', str(self.data), '--check']):
+            self.assertEqual(app.main(), 0)
+        self.assertEqual(seen['config']['ac_id'], '81')
+
+    def test_save_credentials_writes_both_stores_with_machine_scope_for_background(self):
+        scopes = []
+
+        def fake_protect(data, decrypt=False, machine=False):
+            scopes.append((machine, data))
+            return b'dpapi-blob'
+
+        with patch.object(app, 'protect', side_effect=fake_protect):
+            app.save_credentials('sample', 'throwaway-password')
+        self.assertEqual([machine for machine, _ in scopes], [False, True])
+        self.assertEqual((self.data / 'credentials.dat').read_bytes(), b'dpapi-blob')
+        self.assertEqual((self.data / 'credentials.system.dat').read_bytes(), b'dpapi-blob')
+        self.assertFalse((self.data / 'credentials.tmp').exists())
+        self.assertFalse((self.data / 'credentials.system.dat.tmp').exists())
+
+    def test_credential_stores_are_tried_in_order_without_leaking(self):
+        (self.data / 'credentials.dat').write_bytes(b'user-store')
+        (self.data / 'credentials.system.dat').write_bytes(b'machine-store')
+
+        def fake_protect(blob, decrypt=False, machine=False):
+            if blob == b'user-store':
+                raise app.CampusError('unusable user store')
+            return b'{"username":"sample","password":"private-value"}'
+
+        with patch.object(app, 'protect', side_effect=fake_protect):
+            self.assertEqual(app.load_credentials(),
+                             {'username': 'sample', 'password': 'private-value'})
+        with patch.object(app, 'protect', side_effect=app.CampusError('unusable')):
+            with self.assertRaises(app.CampusError) as caught:
+                app.load_credentials()
+        self.assertNotIn('private-value', str(caught.exception))
+
+    @unittest.skipUnless(os.name == 'nt', 'Credential storage requires Windows DPAPI')
+    def test_both_stores_are_real_dpapi_blobs_without_plaintext(self):
+        password = 'throwaway-storage-秘密'
+        app.save_credentials(' sample ', password)
+        expected = json.dumps({'username': 'sample', 'password': password}).encode('utf-8')
+        for name in ('credentials.dat', 'credentials.system.dat'):
+            with self.subTest(name=name):
+                blob = (self.data / name).read_bytes()
+                self.assertNotIn(password.encode('utf-8'), blob)
+                self.assertEqual(app.protect(blob, decrypt=True), expected)
+        self.assertEqual(app.load_credentials(), {'username': 'sample', 'password': password})
+
+    @unittest.skipUnless(os.name == 'nt', 'Credential storage requires Windows DPAPI')
+    def test_machine_store_covers_missing_or_corrupt_user_store(self):
+        password = 'throwaway-storage-秘密'
+        app.save_credentials('sample', password)
+        (self.data / 'credentials.dat').unlink()
+        self.assertEqual(app.load_credentials()['password'], password)
+        (self.data / 'credentials.dat').write_bytes(b'not-a-dpapi-blob')
+        self.assertEqual(app.load_credentials()['password'], password)
 
 
 class CredentialTests(IsolatedTests):
